@@ -1,16 +1,3 @@
-"""
-attention_engine.py
-====================
-Phase 5 module — fuses BlinkResult, HeadPoseResult, and GazeResult into a
-single smoothed attention score with session-level statistics.
-
-Performs NO computer vision and never touches MediaPipe directly.
-Consumes the immutable result objects already produced by:
-    BlinkDetector.update()      -> BlinkResult
-    HeadPoseEstimator.update()  -> HeadPoseResult
-    GazeEstimator.update()      -> GazeResult
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -22,46 +9,35 @@ from head_pose_estimator import HeadPoseResult
 from gaze_estimator import GazeResult, HorizontalDirection, VerticalDirection
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Fixed component weights
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------- Penalty System ----------------
+CALIBRATION_DURATION_S = 3.0
 
-WEIGHT_FACE_PRESENCE: float = 0.30
-WEIGHT_HEAD_POSE:     float = 0.25
-WEIGHT_GAZE:          float = 0.30
-WEIGHT_BLINK:         float = 0.15
+FACE_PENALTY_SHORT = 20
+FACE_PENALTY_MEDIUM = 50
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Calibration
-# ─────────────────────────────────────────────────────────────────────────────
+BLINK_PENALTY_1S = 10
+BLINK_PENALTY_2S = 25
+BLINK_PENALTY_3S = 50
+BLINK_HARD_CAP = 20
 
-CALIBRATION_DURATION_S: float = 3.0
+HEAD_SMALL = 10
+HEAD_MEDIUM = 25
+HEAD_LARGE = 40
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Smoothing
-# ─────────────────────────────────────────────────────────────────────────────
+ROLL_MEDIUM = 10
+ROLL_LARGE = 20
 
-EMA_ALPHA: float = 0.15
+GAZE_SHORT = 5
+GAZE_MEDIUM = 15
+GAZE_LONG = 25
+GAZE_EXTREME = 35
+GAZE_IGNORE = 0.08
+GAZE_WARNING = 0.15
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Score-tolerance constants (deviation from calibrated baseline before
-# a component score starts dropping from 1.0)
-# ─────────────────────────────────────────────────────────────────────────────
+HEAD_GAZE_SYNERGY = 20
+SLEEP_HEADDOWN_SYNERGY = 15
 
-HEAD_PITCH_TOLERANCE_DEG: float = 15.0
-HEAD_YAW_TOLERANCE_DEG:   float = 15.0
-HEAD_RAMP_DEG:            float = 15.0   # additional degrees to fully decay to 0.0
-
-GAZE_RATIO_TOLERANCE: float = 0.15
-GAZE_RAMP:            float = 0.20
-
-EAR_DROP_TOLERANCE: float = 0.05   # allowed drop below normal_EAR before penalty
-EAR_RAMP:           float = 0.10
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Attention state classification
-# ─────────────────────────────────────────────────────────────────────────────
+EMA_ALPHA: float = 0.025
 
 class AttentionState(Enum):
     HIGHLY_ATTENTIVE     = "HIGHLY_ATTENTIVE"
@@ -85,25 +61,14 @@ def _classify_state(score_pct: float, face_present: bool) -> AttentionState:
         return AttentionState.DISTRACTED
     return AttentionState.HIGHLY_DISTRACTED
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Calibration profile
-# ─────────────────────────────────────────────────────────────────────────────
-
 @dataclass
 class CalibrationProfile:
-    """Personal baseline collected during the 3-second calibration stage."""
     neutral_head_pitch:      float = 0.0
     neutral_head_yaw:        float = 0.0
     neutral_gaze_horizontal: float = 0.5
     neutral_gaze_vertical:   float = 0.5
     normal_ear:              float = 0.30
     is_complete:             bool = False
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Session statistics
-# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class SessionStatistics:
@@ -119,41 +84,25 @@ class SessionStatistics:
     long_eye_closures:          int = 0
     face_loss_duration_s:       float = 0.0
 
-    # internal tracking (not part of public stats output)
     _current_distracted_streak_s: float = field(default=0.0, repr=False)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Result object
-# ─────────────────────────────────────────────────────────────────────────────
-
 @dataclass(frozen=True)
 class AttentionResult:
-    raw_score:        float            # current frame composite, 0-100
-    smoothed_score:   float            # EMA-smoothed, 0-100
-    face_score:       float
-    blink_score:      float
-    head_pose_score:  float
-    gaze_score:       float
+    raw_score:        float           
+    smoothed_score:   float            
+    face_penalty: int
+    blink_penalty: int
+    head_penalty: int
+    gaze_penalty: int
     state:            AttentionState
     is_calibrated:    bool
-    calibration_progress: float        # 0.0 - 1.0
+    calibration_progress: float      
     statistics:       SessionStatistics
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AttentionEngine
-# ─────────────────────────────────────────────────────────────────────────────
-
 class AttentionEngine:
-    """
-    Combines BlinkResult, HeadPoseResult, and GazeResult into a single
-    smoothed attention score, with a 3-second calibration stage and
-    session-level statistics tracking.
 
-    Call update() once per processed frame, after all upstream modules
-    (BlinkDetector, HeadPoseEstimator, GazeEstimator) have run for that frame.
-    """
 
     def __init__(self) -> None:
         self._calibration = CalibrationProfile()
@@ -172,12 +121,10 @@ class AttentionEngine:
 
         self._prev_face_present: bool = True
         self._face_absent_start_s: Optional[float] = None
+        self._gaze_away_start_s: Optional[float] = None
         self._last_blink_count_seen: int = 0
         self._last_long_closure_duration: float = -1.0
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Public API
-    # ─────────────────────────────────────────────────────────────────────────
 
     def update(
         self,
@@ -188,49 +135,81 @@ class AttentionEngine:
         timestamp_s: float,
         dt_s: float,
     ) -> AttentionResult:
-        """
-        Process one frame's worth of upstream results.
 
-        Parameters
-        ----------
-        blink_result, head_pose_result, gaze_result:
-            Outputs from the existing Phase 2-4 modules for this frame.
-        face_present:
-            Whether a face was detected this frame (from LandmarkProcessor.is_valid).
-        timestamp_s:
-            Monotonic session time in seconds.
-        dt_s:
-            Elapsed seconds since the previous update() call (for statistics
-            accumulation).
-        """
-        # ── Calibration stage ───────────────────────────────────────────
         if not self._calibration.is_complete:
             self._run_calibration(blink_result, head_pose_result, gaze_result,
                                    face_present, timestamp_s)
 
-        # ── Component scores ────────────────────────────────────────────
-        face_score = 1.0 if face_present else 0.0
+        # ------------------------------------------------------------
+        # Penalty-based scoring
+        # ------------------------------------------------------------
 
-        if face_present and self._calibration.is_complete:
-            blink_score     = self._score_blink(blink_result)
-            head_pose_score = self._score_head_pose(head_pose_result)
-            gaze_score      = self._score_gaze(gaze_result)
-        elif face_present:
-            # Face present but calibration not yet complete: neutral scores.
-            blink_score, head_pose_score, gaze_score = 1.0, 1.0, 1.0
+
+        penalty = 0 
+        blink_penalty = 0
+        head_penalty = 0
+        gaze_penalty = 0  
+
+        # ---------------- Face ----------------
+        if not face_present:
+
+            if self._face_absent_start_s is None:
+                self._face_absent_start_s = timestamp_s
+
+            absent_time = timestamp_s - self._face_absent_start_s
+
+            if absent_time > 10:
+                raw_score = 0.0
+
+            elif absent_time > 3:
+                penalty += FACE_PENALTY_MEDIUM
+                raw_score = max(0.0, 100.0 - penalty)
+
+            elif absent_time > 1:
+                penalty += FACE_PENALTY_SHORT
+                raw_score = max(0.0, 100.0 - penalty)
+
+            else:
+                raw_score = 100.0
+
         else:
-            blink_score, head_pose_score, gaze_score = 0.0, 0.0, 0.0
+            self._face_absent_start_s = None
 
-        # ── Weighted combination ────────────────────────────────────────
-        raw_fraction = (
-            WEIGHT_FACE_PRESENCE * face_score +
-            WEIGHT_HEAD_POSE     * head_pose_score +
-            WEIGHT_GAZE          * gaze_score +
-            WEIGHT_BLINK         * blink_score
-        )
-        raw_score = raw_fraction * 100.0
+            if self._calibration.is_complete:
 
-        # ── EMA smoothing ───────────────────────────────────────────────
+                blink_penalty = self._blink_penalty(blink_result)
+                head_penalty = self._head_penalty(head_pose_result)
+                gaze_penalty = self._gaze_penalty(gaze_result, timestamp_s)
+
+                penalty += blink_penalty
+                penalty += head_penalty
+                penalty += gaze_penalty
+
+                if (
+                    head_penalty >= HEAD_MEDIUM
+                    and gaze_penalty >= GAZE_MEDIUM
+                ):
+                    penalty += HEAD_GAZE_SYNERGY
+
+                if (
+                    blink_result.closure_duration_s >= 3.0
+                    and head_pose_result.pitch >
+                        self._calibration.neutral_head_pitch + 15
+                ):
+                    penalty += SLEEP_HEADDOWN_SYNERGY
+
+                # print(
+                #     f"Blink={blink_penalty} "
+                #     f"Head={head_penalty} "
+                #     f"Gaze={gaze_penalty} "
+                #     f"Total={penalty}"
+                # )
+                raw_score = max(0.0, 100.0 - penalty)
+
+            else:
+                raw_score = 100.0
+            
+
         if not self._ema_initialized:
             self._smoothed_score = raw_score
             self._ema_initialized = True
@@ -239,22 +218,25 @@ class AttentionEngine:
                 EMA_ALPHA * raw_score + (1.0 - EMA_ALPHA) * self._smoothed_score
             )
 
+        print(self._smoothed_score)
+
         state = _classify_state(self._smoothed_score, face_present)
 
-        # ── Statistics ───────────────────────────────────────────────────
         self._update_statistics(state, face_present, blink_result, dt_s)
 
         return AttentionResult(
-            raw_score            = round(raw_score, 1),
-            smoothed_score       = round(self._smoothed_score, 1),
-            face_score           = round(face_score, 3),
-            blink_score          = round(blink_score, 3),
-            head_pose_score      = round(head_pose_score, 3),
-            gaze_score           = round(gaze_score, 3),
-            state                = state,
-            is_calibrated        = self._calibration.is_complete,
-            calibration_progress = self._calibration_progress(timestamp_s),
-            statistics           = self._stats,
+            raw_score               =round(raw_score, 1),
+            smoothed_score          =round(self._smoothed_score, 1),
+
+            face_penalty            =penalty if not face_present else 0,
+            blink_penalty           =blink_penalty,
+            head_penalty            =head_penalty,
+            gaze_penalty            =gaze_penalty,
+
+            state                   =state,
+            is_calibrated           =self._calibration.is_complete,
+            calibration_progress    =self._calibration_progress(timestamp_s),
+            statistics              =self._stats,
         )
 
     @property
@@ -265,9 +247,6 @@ class AttentionEngine:
     def statistics(self) -> SessionStatistics:
         return self._stats
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Calibration
-    # ─────────────────────────────────────────────────────────────────────────
 
     def _run_calibration(
         self,
@@ -308,52 +287,112 @@ class AttentionEngine:
         elapsed = timestamp_s - self._calib_start_s
         return max(0.0, min(1.0, elapsed / CALIBRATION_DURATION_S))
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Component scores (each returns 0.0 - 1.0)
-    # ─────────────────────────────────────────────────────────────────────────
 
-    def _score_blink(self, blink_result: BlinkResult) -> float:
-        if blink_result.eye_state is EyeState.CLOSED:
-            if blink_result.closure_duration_s >= 2.0:
-                return 0.0
-            if blink_result.closure_duration_s >= 0.4:
-                return 0.3
-            return 1.0
+    def _blink_penalty(self, blink_result: BlinkResult) -> int:
 
-        deviation = self._calibration.normal_ear - blink_result.average_ear
-        return _ramp_score(deviation, EAR_DROP_TOLERANCE, EAR_RAMP)
+        if blink_result.eye_state is EyeState.OPEN:
+            return 0
 
-    def _score_head_pose(self, head_pose_result: HeadPoseResult) -> float:
-        pitch_dev = abs(head_pose_result.pitch - self._calibration.neutral_head_pitch)
-        yaw_dev   = abs(head_pose_result.yaw   - self._calibration.neutral_head_yaw)
+        duration = blink_result.closure_duration_s
 
-        pitch_score = _ramp_score(pitch_dev, HEAD_PITCH_TOLERANCE_DEG, HEAD_RAMP_DEG)
-        yaw_score   = _ramp_score(yaw_dev,   HEAD_YAW_TOLERANCE_DEG,   HEAD_RAMP_DEG)
+        if duration >= 5.0:
+            return BLINK_PENALTY_3S
 
-        return min(pitch_score, yaw_score)
+        if duration >= 3.0:
+            return BLINK_PENALTY_3S
 
-    def _score_gaze(self, gaze_result: GazeResult) -> float:
-            h_dev = abs(gaze_result.horizontal_ratio - self._calibration.neutral_gaze_horizontal)
-            v_dev = abs(gaze_result.vertical_ratio   - self._calibration.neutral_gaze_vertical)
+        if duration >= 2.0:
+            return BLINK_PENALTY_2S
 
-            h_score = _ramp_score(h_dev, GAZE_RATIO_TOLERANCE, GAZE_RAMP)
-            v_score = _ramp_score(v_dev, GAZE_RATIO_TOLERANCE, GAZE_RAMP)
-            ratio_score = min(h_score, v_score)
+        if duration >= 1.0:
+            return BLINK_PENALTY_1S
 
-            # GazeEstimator's own horizontal/vertical direction classification
-            # uses fixed geometric thresholds independent of the calibrated
-            # baseline above. When GazeEstimator has already classified gaze
-            # as off-center, the calibration-relative ratio score must not be
-            # allowed to remain near 1.0 just because the deviation hasn't yet
-            # crossed this engine's separate tolerance+ramp window.
-            if not gaze_result.is_looking_center():
-                return 0.0
+        return 0
 
-            return ratio_score
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Statistics
-    # ─────────────────────────────────────────────────────────────────────────
+    def _head_penalty(self, head_pose_result: HeadPoseResult) -> int:
+
+        pitch = abs(head_pose_result.pitch - self._calibration.neutral_head_pitch)
+        yaw   = abs(head_pose_result.yaw   - self._calibration.neutral_head_yaw)
+        roll  = abs(head_pose_result.roll)
+
+        penalty = 0
+
+        # ---------- Pitch ----------
+        if pitch > 40:
+            penalty += HEAD_LARGE
+        elif pitch > 25:
+            penalty += HEAD_MEDIUM
+        elif pitch > 15:
+            penalty += HEAD_SMALL
+
+        # ---------- Yaw ----------
+        if yaw > 40:
+            penalty += HEAD_LARGE
+        elif yaw > 25:
+            penalty += HEAD_MEDIUM
+        elif yaw > 15:
+            penalty += HEAD_SMALL
+
+        # ---------- Roll ----------
+        if roll > 45:
+            penalty += ROLL_LARGE
+        elif roll > 20:
+            penalty += ROLL_MEDIUM
+
+        return penalty
+
+    def _gaze_penalty(
+        self,
+        gaze_result: GazeResult,
+        timestamp_s: float,
+    ) -> int:
+
+        h_dev = abs(
+            gaze_result.horizontal_ratio -
+            self._calibration.neutral_gaze_horizontal
+        )
+
+        v_dev = abs(
+            gaze_result.vertical_ratio -
+            self._calibration.neutral_gaze_vertical
+        )
+
+        # Horizontal gaze is much more reliable than vertical.
+        combined_dev = (
+            0.75 * h_dev +
+            0.25 * v_dev
+        )
+        # print(
+        #     f"H={h_dev:.3f}  "
+        #     f"V={v_dev:.3f}  "
+        #     f"C={combined_dev:.3f}"
+        # )
+        # Ignore natural MediaPipe jitter.
+        if combined_dev < GAZE_IGNORE:
+            self._gaze_away_start_s = None
+            return 0
+
+        # Small eye movement near the centre should not be punished.
+        if combined_dev < GAZE_WARNING:
+            self._gaze_away_start_s = None
+            return 0
+
+        # User has actually looked away.
+        if self._gaze_away_start_s is None:
+            self._gaze_away_start_s = timestamp_s
+            return GAZE_SHORT
+
+        away_time = timestamp_s - self._gaze_away_start_s
+
+        if away_time >= 5.0:
+            return GAZE_EXTREME
+        elif away_time >= 3.0:
+            return GAZE_LONG
+        elif away_time >= 1.0:
+            return GAZE_MEDIUM
+
+        return GAZE_SHORT
 
     def _update_statistics(
         self,
@@ -386,7 +425,6 @@ class AttentionEngine:
             s.time_attentive_s += dt_s
             s._current_distracted_streak_s = 0.0
 
-        # ── Face loss duration ──────────────────────────────────────────
         if not face_present:
             if self._face_absent_start_s is None:
                 self._face_absent_start_s = 0.0  # marker; accumulate via dt
@@ -394,47 +432,20 @@ class AttentionEngine:
         else:
             self._face_absent_start_s = None
 
-        # ── Blink count (cumulative counter already tracked by BlinkDetector) ──
         if blink_result.blink_count > self._last_blink_count_seen:
             s.blink_count = blink_result.blink_count
             self._last_blink_count_seen = blink_result.blink_count
 
-        # ── Long eye closures (count transitions into LONG_CLOSURE / POSSIBLE_SLEEP) ──
         if blink_result.eye_state is EyeState.OPEN and blink_result.last_closure_type in (
             ClosureType.LONG_CLOSURE, ClosureType.POSSIBLE_SLEEP
         ):
-            # Only increment once per completed event: guard with closure_duration_s
-            # transitioning from >0 to the same value across frames is avoided by
-            # tracking the duration value that triggered this branch.
+
             if blink_result.closure_duration_s != self._last_long_closure_duration:
                 s.long_eye_closures += 1
                 self._last_long_closure_duration = blink_result.closure_duration_s
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Pure scoring helper
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _ramp_score(deviation: float, tolerance: float, ramp: float) -> float:
-    """
-    Linear decay score: 1.0 within tolerance, 0.0 beyond tolerance + ramp.
-    """
-    if deviation <= tolerance:
-        return 1.0
-    if deviation >= tolerance + ramp:
-        return 0.0
-    return 1.0 - (deviation - tolerance) / ramp
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Overlay
-# ─────────────────────────────────────────────────────────────────────────────
-
 def draw_attention_overlay(frame_bgr, result: AttentionResult) -> None:
-    """
-    Render the Phase 5 attention HUD: Attention %, State, Calibration status.
-    Positioned top-center to avoid overlap with existing overlays.
-    """
     import cv2
 
     h, w = frame_bgr.shape[:2]
