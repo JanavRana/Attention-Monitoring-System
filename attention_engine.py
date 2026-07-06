@@ -218,7 +218,7 @@ class AttentionEngine:
                 EMA_ALPHA * raw_score + (1.0 - EMA_ALPHA) * self._smoothed_score
             )
 
-        print(self._smoothed_score)
+        # print(self._smoothed_score)
 
         state = _classify_state(self._smoothed_score, face_present)
 
