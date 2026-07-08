@@ -50,13 +50,16 @@ from core.attention_engine import AttentionEngine, draw_attention_overlay
 # ── Phase 6 additions ────────────────────────────────────────────────
 from core.session_logger import SessionLogger
 
+# ── Phase 7 additions ────────────────────────────────────────────────
+from core.report_generator import ReportGenerator
+
 # ─────────────────────────────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────────────────────────────
 CAMERA_INDEX = 0            # change to 1, 2 … if your webcam isn't index 0
 FRAME_WIDTH  = 640
 FRAME_HEIGHT = 480
-SHOW_FACE_MESH = False
+SHOW_FACE_MESH = True
 
 # Minimum milliseconds to wait between processed frames.
 # 66 ms ≈ 15 FPS ceiling — enough for attention monitoring while
@@ -65,12 +68,12 @@ FRAME_DELAY_MS = 66
 
 # MediaPipe FaceLandmarker model — downloaded automatically if absent.
 # Place it anywhere you like; just update MODEL_PATH to match.
-MODEL_FILENAME = "face_landmarker.task"
+MODEL_PATH = "models/"
+MODEL_FILENAME = "models/face_landmarker.task"
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/"
     "face_landmarker/face_landmarker/float16/1/face_landmarker.task"
 )
-MODEL_PATH = "models/face_landmarker.task"
 
 # FaceLandmarker settings
 NUM_FACES            = 1    # single-student monitoring
@@ -435,11 +438,11 @@ def main() -> None:
             draw_overlay(resized_frame, fps, face_found)
             draw_blink_overlay(resized_frame, blink_result) 
 
-            # draw_gaze_visualization(resized_frame, processor)
+            draw_gaze_visualization(resized_frame, processor)
             draw_gaze_overlay(resized_frame, gaze_result)
 
             draw_headpose_overlay(resized_frame, pose_result)
-            # head_pose.draw_debug_axes(resized_frame)   # optional: remove once validated
+            head_pose.draw_debug_axes(resized_frame)   # optional: remove once validated
             draw_attention_overlay(resized_frame, attention_result)
 
             cv2.imshow(WINDOW_NAME, resized_frame)
@@ -461,7 +464,11 @@ def main() -> None:
         if csv_path:
             print(f"[INFO] Session log  → {csv_path}")
             print(f"[INFO] JSON summary → {csv_path.replace('.csv', '_summary.json')}")
-        print("[INFO] Resources released. Session ended cleanly.")
+            try:
+                report_path = ReportGenerator(csv_path).export()
+                print(f"[INFO] HTML report  → {report_path}")
+            except Exception as exc:
+                print(f"[WARN] Report generation failed: {exc}", file=sys.stderr)
 
 
 if __name__ == "__main__":
