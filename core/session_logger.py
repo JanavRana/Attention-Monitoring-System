@@ -46,10 +46,10 @@ import os
 from datetime import datetime
 from typing import Optional
 
-from attention_engine import AttentionResult, SessionStatistics
-from blink_detector import BlinkResult
-from gaze_estimator import GazeResult
-from head_pose_estimator import HeadPoseResult
+from .attention_engine import AttentionResult, SessionStatistics
+from .blink_detector import BlinkResult
+from .gaze_estimator import GazeResult
+from .head_pose_estimator import HeadPoseResult
 
 
 # ─────────────────────────────────────────────────────────────────────────────
