@@ -60,7 +60,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from landmark_processor import LandmarkProcessor, HEAD_POSE_LANDMARKS
+from .landmark_processor import LandmarkProcessor, HEAD_POSE_LANDMARKS
 
 
 # ─────────────────────────────────────────────────────────────────────────────

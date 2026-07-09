@@ -43,7 +43,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from landmark_processor import (
+from .landmark_processor import (
     LandmarkProcessor,
     LEFT_EYE_EAR,
     RIGHT_EYE_EAR,
