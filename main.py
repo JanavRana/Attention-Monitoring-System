@@ -33,16 +33,25 @@ from mediapipe.tasks.python import vision as mp_vision
 from mediapipe.tasks.python.vision import drawing_utils as mp_drawing
 
 # ── Phase 2 additions ────────────────────────────────────────────────
-from landmark_processor import LandmarkProcessor
-from blink_detector import BlinkDetector, BlinkResult, EyeState, ClosureType
+from core.landmark_processor import LandmarkProcessor
+from core.blink_detector import BlinkDetector, BlinkResult, EyeState, ClosureType
 
 # ── Phase 3 additions ────────────────────────────────────────────────
-from head_pose_estimator import HeadPoseEstimator, draw_headpose_overlay
+from core.head_pose_estimator import HeadPoseEstimator, draw_headpose_overlay
 
 # ── Phase 4 additions ────────────────────────────────────────────────
-from gaze_estimator import (
+from core.gaze_estimator import (
     GazeEstimator, draw_gaze_visualization, draw_gaze_overlay,
 )
+
+# ── Phase 5 additions ────────────────────────────────────────────────
+from core.attention_engine import AttentionEngine, draw_attention_overlay
+
+# ── Phase 6 additions ────────────────────────────────────────────────
+from core.session_logger import SessionLogger
+
+# ── Phase 7 additions ────────────────────────────────────────────────
+from core.report_generator import ReportGenerator
 
 # ─────────────────────────────────────────────────────────────────────
 # Configuration
@@ -50,6 +59,7 @@ from gaze_estimator import (
 CAMERA_INDEX = 0            # change to 1, 2 … if your webcam isn't index 0
 FRAME_WIDTH  = 640
 FRAME_HEIGHT = 480
+SHOW_FACE_MESH = True
 
 # Minimum milliseconds to wait between processed frames.
 # 66 ms ≈ 15 FPS ceiling — enough for attention monitoring while
@@ -58,7 +68,8 @@ FRAME_DELAY_MS = 66
 
 # MediaPipe FaceLandmarker model — downloaded automatically if absent.
 # Place it anywhere you like; just update MODEL_PATH to match.
-MODEL_FILENAME = "face_landmarker.task"
+MODEL_PATH = "models/"
+MODEL_FILENAME = "models/face_landmarker.task"
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/"
     "face_landmarker/face_landmarker/float16/1/face_landmarker.task"
@@ -352,6 +363,9 @@ def main() -> None:
     blink_det     = BlinkDetector()
     gaze_est      = GazeEstimator()
     head_pose     = HeadPoseEstimator(FRAME_WIDTH, FRAME_HEIGHT)
+    attention_eng = AttentionEngine()
+    session_logger = SessionLogger()          # auto-names file → sessions/session_YYYYMMDD_HHMMSS.csv
+    _last_log_s    = 0.0                      # throttle tracker
 
     print("[INFO] Pipeline initialised — showing live feed.")
     print("       Green mesh = face detected.  Red text = no face found.")
@@ -393,7 +407,25 @@ def main() -> None:
 
             pose_result  = head_pose.update(processor, timestamp_s)
 
-            face_found = draw_face_mesh(resized_frame, result)
+            dt_s = timestamp_s - prev_timestamp_s if 'prev_timestamp_s' in dir() else 1/15
+            prev_timestamp_s = timestamp_s
+
+            attention_result = attention_eng.update(
+                blink_result, pose_result, gaze_result,
+                processor.is_valid, timestamp_s, dt_s,
+            )
+            # ── Phase 6: log one tick per second after calibration ───────────────
+            if attention_eng.calibration.is_complete and timestamp_s - _last_log_s >= 1.0:
+                session_logger.log_tick(
+                    attention_result, blink_result, pose_result, gaze_result,
+                    processor.is_valid, timestamp_s,
+                )
+                _last_log_s = timestamp_s
+
+            if SHOW_FACE_MESH:
+                face_found = draw_face_mesh(resized_frame, result)
+            else:
+                face_found = processor.is_valid
 
 
             # FPS: simple delta-time (no rolling average needed for a
@@ -404,13 +436,14 @@ def main() -> None:
 
             # Existing overlay + new blink overlay
             draw_overlay(resized_frame, fps, face_found)
-            # draw_blink_overlay(resized_frame, blink_result) 
+            draw_blink_overlay(resized_frame, blink_result) 
 
             draw_gaze_visualization(resized_frame, processor)
             draw_gaze_overlay(resized_frame, gaze_result)
 
-            # draw_headpose_overlay(resized_frame, pose_result)
-            # head_pose.draw_debug_axes(resized_frame)   # optional: remove once validated
+            draw_headpose_overlay(resized_frame, pose_result)
+            head_pose.draw_debug_axes(resized_frame)   # optional: remove once validated
+            draw_attention_overlay(resized_frame, attention_result)
 
             cv2.imshow(WINDOW_NAME, resized_frame)
 
@@ -427,7 +460,15 @@ def main() -> None:
         cap.release()
         detector.close()
         cv2.destroyAllWindows()
-        print("[INFO] Resources released. Session ended cleanly.")
+        csv_path = session_logger.close()
+        if csv_path:
+            print(f"[INFO] Session log  → {csv_path}")
+            print(f"[INFO] JSON summary → {csv_path.replace('.csv', '_summary.json')}")
+            try:
+                report_path = ReportGenerator(csv_path).export()
+                print(f"[INFO] HTML report  → {report_path}")
+            except Exception as exc:
+                print(f"[WARN] Report generation failed: {exc}", file=sys.stderr)
 
 
 if __name__ == "__main__":
