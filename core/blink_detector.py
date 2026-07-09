@@ -1,414 +1,467 @@
 """
-Phase 1: Webcam Capture + MediaPipe Face Mesh Validation
-==========================================================
-Target hardware : AMD Ryzen 5 3450U, 8 GB RAM, CPU-only, Windows
-MediaPipe       : 0.10.x+ (Tasks API — mp.solutions was removed)
-Python          : 3.10+
+blink_detector.py
+=================
+Phase 2 module — Eye Aspect Ratio (EAR) blink and eye-closure detector.
 
-What changed from the old API (mp.solutions.face_mesh):
-  - MediaPipe 0.10 completely replaced mp.solutions with a Tasks API.
-  - A separate .task model file must be present (auto-downloaded below).
-  - Detector is now  mp_vision.FaceLandmarker  (VIDEO running mode).
-  - Connection constants live in  mp_vision.FaceLandmarksConnections.
-  - Drawing utilities are in  mp_vision.drawing_utils.
+Mathematics — Eye Aspect Ratio (Soukupová & Čech, 2016)
+---------------------------------------------------------
+Six landmarks per eye (p1..p6) placed at the corners and eyelid edges:
 
-Pipeline this script validates:
-    Webcam -> OpenCV capture -> resize 640x480 -> BGR->RGB ->
-    mediapipe.Image -> FaceLandmarker.detect_for_video() ->
-    draw connections + landmarks -> FPS counter -> imshow -> 'q' to quit
+                    p2 ───── p3
+                   /            |
+        p1 -----                  ----- p4      <- horizontal (open)
+                   |            /
+                    p6 ───── p5
 
-Nothing else is implemented here (no gaze, blink, pose, scoring, logging).
+    EAR = ( ‖p2 – p6‖ + ‖p3 – p5‖ ) / ( 2 · ‖p1 – p4‖ )
+
+Typical values:
+    Open eye   : 0.25 – 0.35   (numerator is large)
+    Blinking   : 0.10 – 0.20   (numerator shrinking)
+    Closed eye : 0.00 – 0.08   (numerator near zero)
+
+The ratio is dimensionless and scale-invariant (pixel-to-pixel distances
+cancel out), so it does not change when the user moves closer to or further
+from the camera.
+
+Both eyes are computed and averaged:
+    avg_EAR = (EAR_left + EAR_right) / 2
+
+Averaging across both eyes reduces sensitivity to single-eye landmark noise
+from glasses reflections, partial face shadows, or minor face rotation.
+
+State machine
+-------------
+
+    OPEN  ─── EAR drops below threshold ───▶  CLOSED
+    OPEN  ◀── EAR rises above threshold ───   CLOSED
+                                          ↑
+                         classify + count EXACTLY HERE (CLOSED→OPEN edge)
+
+Rules:
+  • While CLOSED: nothing is counted or classified.  Holding eyes shut does
+    NOT accumulate blink_count.
+  • At CLOSED→OPEN: the closure duration is measured and classified once.
+    < 0.4 s   → BLINK         (normal involuntary blink, blink_count += 1)
+    0.4–2.0 s → LONG_CLOSURE  (drowsiness/deliberate, flagged but not counted)
+    ≥ 2.0 s   → POSSIBLE_SLEEP (significant flag, future scoring will penalize)
+
+Face loss during closure:
+  If the face disappears mid-blink (detection dropout from fast head turn or
+  bad lighting), the state machine resets to OPEN rather than freezing in
+  CLOSED, which would trigger a phantom long-closure or sleep event when the
+  face re-appears.
+
+Dependencies
+------------
+    landmark_processor.py  — must be updated for the same frame before calling
+                             BlinkDetector.update().
+
+Landmark indices
+----------------
+    Imported from ``landmark_processor`` — no index constants are duplicated
+    here.  This enforces the single-source-of-truth rule from the design doc.
 """
 
-import os
-import sys
-import time
-import urllib.request
+from __future__ import annotations
 
-import cv2
-import mediapipe as mp
+from dataclasses import dataclass
+from enum import Enum
+from typing import Optional
+
 import numpy as np
-from mediapipe.tasks import python as mp_python
-from mediapipe.tasks.python import vision as mp_vision
-from mediapipe.tasks.python.vision import drawing_utils as mp_drawing
 
-# ── Phase 2 additions ────────────────────────────────────────────────
-from landmark_processor import LandmarkProcessor
-from blink_detector import BlinkDetector, BlinkResult, EyeState, ClosureType
-
-# ─────────────────────────────────────────────────────────────────────
-# Configuration
-# ─────────────────────────────────────────────────────────────────────
-CAMERA_INDEX = 0            # change to 1, 2 … if your webcam isn't index 0
-FRAME_WIDTH  = 640
-FRAME_HEIGHT = 480
-
-# Minimum milliseconds to wait between processed frames.
-# 66 ms ≈ 15 FPS ceiling — enough for attention monitoring while
-# leaving CPU headroom on a Ryzen 5 3450U.
-FRAME_DELAY_MS = 66
-
-# MediaPipe FaceLandmarker model — downloaded automatically if absent.
-# Place it anywhere you like; just update MODEL_PATH to match.
-MODEL_FILENAME = "face_landmarker.task"
-MODEL_URL = (
-    "https://storage.googleapis.com/mediapipe-models/"
-    "face_landmarker/face_landmarker/float16/1/face_landmarker.task"
-)
-
-# FaceLandmarker settings
-NUM_FACES            = 1    # single-student monitoring
-MIN_DETECTION_CONF   = 0.6
-MIN_PRESENCE_CONF    = 0.6  # Tasks API uses this instead of min_tracking_confidence
-MIN_TRACKING_CONF    = 0.6
-
-WINDOW_NAME = "Phase 1 – Face Mesh Validation  |  press 'q' to quit"
+from .landmark_processor import LandmarkProcessor, LEFT_EYE_EAR, RIGHT_EYE_EAR
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Connection subsets used for drawing
-# Two draw passes: light tessellation (full mesh) then bold contours.
-# ─────────────────────────────────────────────────────────────────────
-FLC = mp_vision.FaceLandmarksConnections   # shorthand
+# ─────────────────────────────────────────────────────────────────────────────
+# Threshold constants
+# Isolated here so Phase 5 (per-user calibration) can replace these with
+# measured values by passing them into __init__, without touching any of the
+# detection logic below.
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Convert frozenset of Connection namedtuples to the list-of-Connection
-# format expected by drawing_utils.draw_landmarks.
-TESSELATION = list(FLC.FACE_LANDMARKS_TESSELATION)
-CONTOURS    = (
-    list(FLC.FACE_LANDMARKS_LEFT_EYE)
-    + list(FLC.FACE_LANDMARKS_RIGHT_EYE)
-    + list(FLC.FACE_LANDMARKS_LEFT_EYEBROW)
-    + list(FLC.FACE_LANDMARKS_RIGHT_EYEBROW)
-    + list(FLC.FACE_LANDMARKS_LIPS)
-    + list(FLC.FACE_LANDMARKS_FACE_OVAL)
-)
-IRIS_CONTOURS = (
-    list(FLC.FACE_LANDMARKS_LEFT_IRIS)
-    + list(FLC.FACE_LANDMARKS_RIGHT_IRIS)
-)
+EAR_CLOSED_THRESHOLD: float = 0.21
+"""
+EAR below this value → eyes considered closed.
+Design doc default (Section 4.4): 0.21.
+Population open-eye range: 0.25–0.35.  0.21 is conservatively low so people
+with smaller eyes or slightly hooded lids don't trigger false closures at rest.
+"""
+
+BLINK_MAX_DURATION_S: float = 0.40
+"""
+Closure shorter than this → classified as a normal blink (counted).
+Human voluntary/involuntary blink duration: roughly 100–400 ms
+(Sirevaag & Stern, 1994).  0.40 s matches the design doc's boundary.
+"""
+
+LONG_CLOSURE_MIN_S: float = 0.40   # same as BLINK_MAX_DURATION_S (boundary)
+LONG_CLOSURE_MAX_S: float = 2.00
+"""
+Closure in [0.40, 2.00) s → classified as a long closure (flagged but NOT
+counted as a blink).  Indicates deliberate closure, drowsiness, or
+concentration with closed eyes.
+"""
+
+SLEEP_THRESHOLD_S: float = 2.00
+"""
+Closure ≥ 2.00 s → classified as possible sleep / severe inattention.
+Will receive significant score penalty in Phase 5 (AttentionScoringEngine).
+"""
 
 
-def download_model(path: str, url: str) -> None:
+# ─────────────────────────────────────────────────────────────────────────────
+# Enumerations
+# ─────────────────────────────────────────────────────────────────────────────
+
+class EyeState(Enum):
+    """Current binary eye state based on the most recently processed frame."""
+    OPEN   = "OPEN"
+    CLOSED = "CLOSED"
+
+
+class ClosureType(Enum):
+    """Classification of the most recently *completed* eye closure event."""
+    NONE           = "NONE"           # No closure event has occurred yet
+    BLINK          = "BLINK"          # < 0.40 s — normal blink, counted
+    LONG_CLOSURE   = "LONG_CLOSURE"   # 0.40 – 2.00 s — prolonged, flagged
+    POSSIBLE_SLEEP = "POSSIBLE_SLEEP" # ≥ 2.00 s — significant event, flagged
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Result dataclass
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class BlinkResult:
     """
-    Download the FaceLandmarker .task model file if it isn't already present.
-    The file is ~2.5 MB (float16 variant) and only needs to be downloaded once.
+    Immutable snapshot of blink detector state after processing one frame.
+
+    ``frozen=True`` ensures no downstream code mutates a stale result; it also
+    makes ``BlinkResult`` hashable, which is useful for deque-based logging.
+
+    Attributes
+    ----------
+    left_ear, right_ear, average_ear:
+        Eye Aspect Ratios for this frame, rounded to 3 decimal places.
+    eye_state:
+        Current open/closed binary state.
+    blink_count:
+        Cumulative total of normal blinks (< 0.40 s closures) since session start.
+    closure_duration_s:
+        If currently closed: live elapsed closure duration.
+        If just opened: duration of the closure that just completed.
+        Otherwise: duration of the last completed closure.
+    last_closure_type:
+        Category of the most recently *completed* closure event.
     """
-    if os.path.exists(path):
-        return
-
-    print(f"[INFO] Model file '{path}' not found — downloading (~2.5 MB)...")
-    print(f"       URL: {url}")
-
-    try:
-        # Add a User-Agent header; some CDNs reject plain urllib requests.
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=30) as response, \
-             open(path, "wb") as out_file:
-            total = int(response.headers.get("Content-Length", 0))
-            downloaded = 0
-            chunk_size = 65536  # 64 KB chunks
-            while chunk := response.read(chunk_size):
-                out_file.write(chunk)
-                downloaded += len(chunk)
-                if total:
-                    pct = downloaded / total * 100
-                    print(f"\r       {pct:5.1f}%  ({downloaded:,} / {total:,} bytes)", end="", flush=True)
-        print(f"\n[INFO] Model saved to '{path}'.")
-    except Exception as exc:
-        # Clean up a partial file so the next run retries properly.
-        if os.path.exists(path):
-            os.remove(path)
-        raise RuntimeError(
-            f"Failed to download model: {exc}\n"
-            "       Manual download: go to the URL above and save the file as\n"
-            f"       '{os.path.abspath(path)}'"
-        ) from exc
+    left_ear: float
+    right_ear: float
+    average_ear: float
+    eye_state: EyeState
+    blink_count: int
+    closure_duration_s: float
+    last_closure_type: ClosureType
 
 
-def init_webcam(camera_index: int) -> cv2.VideoCapture:
+# ─────────────────────────────────────────────────────────────────────────────
+# BlinkDetector
+# ─────────────────────────────────────────────────────────────────────────────
+
+class BlinkDetector:
     """
-    Open the webcam and confirm it is readable.
-    Raises RuntimeError with a helpful message if unavailable.
-    """
-    cap = cv2.VideoCapture(camera_index)
+    Detects blinks and eye-closure events from MediaPipe face landmarks using
+    the Eye Aspect Ratio (EAR).  No ML, no extra models — pure geometry.
 
-    if not cap.isOpened():
-        raise RuntimeError(
-            f"Could not open webcam at index {camera_index}.\n"
-            "  • Check the camera is connected and not in use by another app.\n"
-            "  • Try changing CAMERA_INDEX to 1 or 2 if you have multiple cameras."
+    The detector is instantiated once per session.  Its ``update()`` method is
+    called every processed frame, after ``LandmarkProcessor.update()`` has been
+    called for the same frame.
+
+    Example
+    -------
+    ::
+
+        detector = BlinkDetector()
+
+        # In the per-frame loop (after processor.update(result)):
+        blink_result = detector.update(processor, timestamp_s)
+        print(blink_result.blink_count, blink_result.eye_state.value)
+    """
+
+    def __init__(
+        self,
+        ear_threshold: float = EAR_CLOSED_THRESHOLD,
+        blink_max_duration_s: float = BLINK_MAX_DURATION_S,
+        sleep_threshold_s: float = SLEEP_THRESHOLD_S,
+    ) -> None:
+        """
+        Parameters
+        ----------
+        ear_threshold:
+            EAR below this → eyes closed.  Override for per-user calibration.
+        blink_max_duration_s:
+            Maximum closure duration (s) to count as a normal blink.
+        sleep_threshold_s:
+            Closure at or above this duration (s) → POSSIBLE_SLEEP flag.
+        """
+        # Configurable thresholds (replaceable by calibration in Phase 5)
+        self._ear_threshold    = ear_threshold
+        self._blink_max_s      = blink_max_duration_s
+        self._sleep_s          = sleep_threshold_s
+
+        # ── State machine ──────────────────────────────────────────────
+        self._eye_state: EyeState = EyeState.OPEN
+        # Wall-clock time (monotonic seconds from session_start_s) when the
+        # current closure began; None when eyes are open.
+        self._closure_start_s: Optional[float] = None
+
+        # ── Accumulators ───────────────────────────────────────────────
+        self._blink_count: int = 0
+        self._last_closure_type: ClosureType = ClosureType.NONE
+        self._last_closure_duration_s: float = 0.0
+
+        # ── Per-frame EAR values (written each update, read by overlay) ─
+        self._left_ear:  float = 0.0
+        self._right_ear: float = 0.0
+        self._avg_ear:   float = 0.0
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Core per-frame update
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def update(
+        self,
+        processor: LandmarkProcessor,
+        timestamp_s: float,
+    ) -> BlinkResult:
+        """
+        Compute EAR for this frame and advance the blink state machine.
+
+        Parameters
+        ----------
+        processor:
+            A ``LandmarkProcessor`` already updated for this frame via
+            ``processor.update(result)``.
+        timestamp_s:
+            Monotonic wall-clock time in seconds, measured from the session
+            start.  In ``phase1_face_mesh.py`` this is::
+
+                timestamp_s = time.monotonic() - session_start_s
+
+            Using wall-clock time rather than frame count makes closure
+            duration measurement robust to variable FPS.  Must be
+            monotonically increasing (no resets, no system-time jumps).
+
+        Returns
+        -------
+        BlinkResult
+            Immutable snapshot of detector state after processing this frame.
+        """
+        if not processor.is_valid:
+            # No face detected this frame.
+            # Reset transient state so a detection dropout mid-blink does not
+            # leave the machine stuck in CLOSED, which would create a phantom
+            # long-closure or sleep event when the face reappears.
+            self._on_face_lost()
+            return self._build_result(timestamp_s)
+
+        # ── Compute EAR for both eyes ──────────────────────────────────
+        left_pts  = processor.get_landmarks(LEFT_EYE_EAR)
+        right_pts = processor.get_landmarks(RIGHT_EYE_EAR)
+
+        self._left_ear  = _compute_ear(left_pts)
+        self._right_ear = _compute_ear(right_pts)
+        self._avg_ear   = (self._left_ear + self._right_ear) / 2.0
+
+        # ── Advance state machine ──────────────────────────────────────
+        self._advance_state(self._avg_ear, timestamp_s)
+
+        return self._build_result(timestamp_s)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # State machine
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _advance_state(self, avg_ear: float, timestamp_s: float) -> None:
+        """
+        Transition the OPEN/CLOSED state and handle event counting.
+
+        The central invariant: ``blink_count`` is incremented ONLY at the
+        CLOSED→OPEN edge.  It is never incremented while the eye remains
+        closed.  This prevents "holding eyes shut" from inflating the count.
+        """
+        eyes_currently_closed = avg_ear < self._ear_threshold
+
+        if eyes_currently_closed:
+            if self._eye_state is EyeState.OPEN:
+                # ── OPEN → CLOSED transition ──────────────────────────
+                # Record when this closure started.
+                self._eye_state       = EyeState.CLOSED
+                self._closure_start_s = timestamp_s
+            # While staying CLOSED: do nothing.  Duration accumulates in
+            # wall time; it will be read in _build_result and at the edge.
+
+        else:
+            # Eyes are open (or became open again this frame).
+            if self._eye_state is EyeState.CLOSED:
+                # ── CLOSED → OPEN transition ──────────────────────────
+                # Compute total closure duration and classify the event.
+                start    = self._closure_start_s if self._closure_start_s is not None else timestamp_s
+                duration = timestamp_s - start
+                self._last_closure_duration_s = duration
+                self._classify_and_count(duration)
+                self._closure_start_s = None
+
+            self._eye_state = EyeState.OPEN
+
+    def _classify_and_count(self, duration_s: float) -> None:
+        """
+        Classify a completed closure event and update counters.
+
+        Called exactly once per closure event, at the CLOSED→OPEN edge.
+        Only BLINK events increment blink_count.
+
+        Parameters
+        ----------
+        duration_s:
+            Total duration of the closure that just ended.
+        """
+        if duration_s >= self._sleep_s:
+            # ≥ 2.0 s — significant distraction / possible sleep
+            self._last_closure_type = ClosureType.POSSIBLE_SLEEP
+
+        elif duration_s >= self._blink_max_s:
+            # 0.40 – 2.0 s — deliberate or drowsy extended closure
+            self._last_closure_type = ClosureType.LONG_CLOSURE
+
+        else:
+            # < 0.40 s — normal involuntary blink
+            self._last_closure_type = ClosureType.BLINK
+            self._blink_count += 1
+
+    def _on_face_lost(self) -> None:
+        """
+        Reset transient closure state when the face disappears.
+
+        Does NOT reset blink_count or last_closure_type — those are session
+        accumulators that should persist across brief detection dropouts.
+        """
+        self._eye_state       = EyeState.OPEN
+        self._closure_start_s = None
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Result builder
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _build_result(self, timestamp_s: float) -> BlinkResult:
+        """
+        Assemble current detector state into an immutable BlinkResult.
+
+        Live closure duration: while the eyes are still closed, the closure
+        duration field shows how long they have been closed so far (useful
+        for the overlay display).  Once the eyes open, it holds the duration
+        of the closure that just completed.
+        """
+        if self._eye_state is EyeState.CLOSED and self._closure_start_s is not None:
+            # Eyes are currently closed — report live elapsed duration.
+            closure_dur = timestamp_s - self._closure_start_s
+        else:
+            # Eyes open — report duration of the last completed closure.
+            closure_dur = self._last_closure_duration_s
+
+        return BlinkResult(
+            left_ear           = round(self._left_ear,  3),
+            right_ear          = round(self._right_ear, 3),
+            average_ear        = round(self._avg_ear,   3),
+            eye_state          = self._eye_state,
+            blink_count        = self._blink_count,
+            closure_duration_s = round(closure_dur, 3),
+            last_closure_type  = self._last_closure_type,
         )
 
-    # Request the target resolution; the driver may return something different,
-    # which is why we resize every frame explicitly in the main loop.
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+    # ─────────────────────────────────────────────────────────────────────────
+    # Convenience properties
+    # Provide direct attribute access without needing to unpack a BlinkResult.
+    # Used by the overlay drawing code and (in later phases) the scoring engine.
+    # ─────────────────────────────────────────────────────────────────────────
 
-    # Cap the camera's own FPS to our target — avoids the driver buffering
-    # extra frames that we'll never use, which wastes memory and adds latency.
-    cap.set(cv2.CAP_PROP_FPS, 1000 / FRAME_DELAY_MS)
+    @property
+    def blink_count(self) -> int:
+        """Total normal blinks counted since session start."""
+        return self._blink_count
 
-    return cap
+    @property
+    def left_ear(self) -> float:
+        """Most recent left-eye EAR value (updated each frame)."""
+        return self._left_ear
+
+    @property
+    def right_ear(self) -> float:
+        """Most recent right-eye EAR value (updated each frame)."""
+        return self._right_ear
+
+    @property
+    def average_ear(self) -> float:
+        """Most recent averaged EAR value (updated each frame)."""
+        return self._avg_ear
+
+    @property
+    def eye_closed(self) -> bool:
+        """``True`` if eyes are currently classified as closed."""
+        return self._eye_state is EyeState.CLOSED
 
 
-def init_face_landmarker(model_path: str) -> mp_vision.FaceLandmarker:
+# ─────────────────────────────────────────────────────────────────────────────
+# Pure EAR computation function
+# Module-level so it can be unit-tested independently of the class.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _compute_ear(eye_points: np.ndarray | None) -> float:
     """
-    Create the FaceLandmarker detector in VIDEO running mode.
+    Compute the Eye Aspect Ratio for one eye.
 
-    VIDEO mode vs IMAGE mode:
-      IMAGE mode  — treats every frame independently (full detection every time).
-      VIDEO mode  — uses internal temporal tracking: after the first detection,
-                    it seeds subsequent frames with the previous result, which
-                    is much cheaper and produces smoother landmark positions.
-                    This is the correct mode for a webcam stream.
+    Parameters
+    ----------
+    eye_points:
+        numpy array of shape (6, 3) — pixel coordinates for p1..p6.
+        Columns: [x_pixel, y_pixel, z_normalized].
 
-    Why these confidence values (0.6):
-      Too low  (e.g. 0.3) → jittery, low-quality locks in dim lighting.
-      Too high (e.g. 0.9) → frequent tracking drops that force expensive
-                             full re-detections, hammering CPU.
-      0.6 is a balanced starting point for an average laptop webcam indoors.
+    Returns
+    -------
+    float
+        EAR value.  Returns 0.0 on ``None`` input or degenerate geometry.
+
+    Implementation note
+    -------------------
+    Only x and y pixel coordinates are used (``[:, :2]`` slice).  The z
+    column is the normalized relative depth MediaPipe provides — it does not
+    contribute to a 2-D aspect ratio and is discarded here.
+
+    Using pixel coordinates (not normalized) is correct: the formula is a
+    ratio of distances and is scale-invariant.  Whether the distances are in
+    pixels or any other unit, the result is the same dimensionless number.
+
+    The six 2-D distance calls (``np.linalg.norm`` on 2-element vectors) take
+    ~0.010 ms total per eye on the target hardware — negligible.
     """
-    base_opts = mp_python.BaseOptions(model_asset_path=model_path)
-    options   = mp_vision.FaceLandmarkerOptions(
-        base_options                     = base_opts,
-        running_mode                     = mp_vision.RunningMode.VIDEO,
-        num_faces                        = NUM_FACES,
-        min_face_detection_confidence    = MIN_DETECTION_CONF,
-        min_face_presence_confidence     = MIN_PRESENCE_CONF,
-        min_tracking_confidence          = MIN_TRACKING_CONF,
-        output_face_blendshapes          = False,   # not needed in Phase 1–4
-        output_facial_transformation_matrixes = False,   # we compute solvePnP ourselves in Phase 3
-    )
-    return mp_vision.FaceLandmarker.create_from_options(options)
+    if eye_points is None or eye_points.shape != (6, 3):
+        return 0.0
 
+    # Unpack p1..p6, discarding z.
+    p1, p2, p3, p4, p5, p6 = eye_points[:, :2]
 
-def detect_landmarks(
-    detector: mp_vision.FaceLandmarker,
-    frame_bgr: np.ndarray,
-    timestamp_ms: int,
-):
-    """
-    Resize the frame, convert to RGB, wrap in a mediapipe.Image, and run
-    landmark detection.
+    # Numerator: two vertical eyelid spans
+    vertical_a = np.linalg.norm(p2 - p6)   # outer pair: upper-outer ↔ lower-outer
+    vertical_b = np.linalg.norm(p3 - p5)   # inner pair: upper-inner ↔ lower-inner
 
-    Returns (resized_bgr_frame, FaceLandmarkerResult).
-    The resized frame is returned so downstream drawing works on the same
-    array that was passed to MediaPipe (same dimensions, same content).
-    """
-    resized_bgr = cv2.resize(frame_bgr, (FRAME_WIDTH, FRAME_HEIGHT))
+    # Denominator: horizontal eye width × 2
+    horizontal = np.linalg.norm(p1 - p4)
 
-    # MediaPipe expects RGB; OpenCV delivers BGR.
-    rgb = cv2.cvtColor(resized_bgr, cv2.COLOR_BGR2RGB)
+    if horizontal < 1.0:
+        # Degenerate frame: outer and inner corners are coincident (< 1 pixel
+        # apart).  This can happen during extreme profile views or severely
+        # corrupted landmark tracking.  Return 0 rather than a divide error.
+        return 0.0
 
-    # mp.Image is a lightweight wrapper — it does NOT copy the array.
-    mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-
-    # detect_for_video requires monotonically increasing timestamps (ms).
-    result = detector.detect_for_video(mp_img, timestamp_ms)
-
-    return resized_bgr, result
-
-
-def draw_face_mesh(frame_bgr: np.ndarray, result) -> bool:
-    """
-    Draw the face mesh on the frame using the Tasks API drawing utilities.
-
-    Two-pass drawing:
-      Pass 1 — full tessellation in dim grey (shows all 478 points as a mesh).
-      Pass 2 — bold contours for eyes, eyebrows, lips, face oval, and irises.
-
-    Returns True if a face was found and drawn, False otherwise.
-    """
-    if not result.face_landmarks:
-        return False   # no face detected this frame
-
-    # The Tasks API draw_landmarks() operates on a BGR numpy array directly.
-    # Unlike the old solutions API, it does NOT need the frame as an mp.Image.
-    for face_lms in result.face_landmarks:
-
-        # ── Pass 1: light tessellation ────────────────────────────────
-        mp_drawing.draw_landmarks(
-            image                  = frame_bgr,
-            landmark_list          = face_lms,
-            connections            = TESSELATION,
-            landmark_drawing_spec  = None,           # hide individual dots in this pass
-            connection_drawing_spec= mp_drawing.DrawingSpec(
-                color=(50, 50, 50), thickness=1, circle_radius=1
-            ),
-            is_drawing_landmarks   = False,
-        )
-
-        # ── Pass 2: bold contour lines ────────────────────────────────
-        mp_drawing.draw_landmarks(
-            image                  = frame_bgr,
-            landmark_list          = face_lms,
-            connections            = CONTOURS,
-            landmark_drawing_spec  = mp_drawing.DrawingSpec(
-                color=(0, 255, 0), thickness=1, circle_radius=1
-            ),
-            connection_drawing_spec= mp_drawing.DrawingSpec(
-                color=(0, 255, 0), thickness=1, circle_radius=1
-            ),
-            is_drawing_landmarks   = True,
-        )
-
-        # ── Pass 3: iris circles in cyan ──────────────────────────────
-        # Iris landmarks (468–477) are only available when the model
-        # includes refined landmarks, which the float16 model does.
-        mp_drawing.draw_landmarks(
-            image                  = frame_bgr,
-            landmark_list          = face_lms,
-            connections            = IRIS_CONTOURS,
-            landmark_drawing_spec  = None,
-            connection_drawing_spec= mp_drawing.DrawingSpec(
-                color=(255, 255, 0), thickness=2, circle_radius=1
-            ),
-            is_drawing_landmarks   = False,
-        )
-
-    return True
-
-
-def draw_overlay(frame_bgr: np.ndarray, fps: float, face_found: bool) -> None:
-    """
-    Render a minimal HUD: FPS counter and face-detection status.
-    Using LINE_AA (anti-aliased) keeps text readable at small sizes.
-    """
-    fps_text  = f"FPS: {fps:.1f}"
-    face_text = "Face: DETECTED" if face_found else "Face: NOT FOUND"
-    face_color = (0, 255, 0) if face_found else (0, 0, 255)
-
-    cv2.putText(frame_bgr, fps_text,  (10, 25),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
-    cv2.putText(frame_bgr, face_text, (10, 52),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, face_color,  2, cv2.LINE_AA)
-    cv2.putText(frame_bgr, "Press 'q' to quit", (10, FRAME_HEIGHT - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
-
-
-def draw_blink_overlay(frame_bgr: np.ndarray, blink_result: BlinkResult) -> None:
-    """
-    Render Phase 2 blink debug HUD in the bottom-left corner.
-    Six fixed-position text lines — no per-frame layout computation.
-    """
-    x        = 10
-    y_base   = FRAME_HEIGHT - 135    # anchor: 135 px from bottom edge
-    line_gap = 22                    # vertical gap between lines
-
-    is_closed    = blink_result.eye_state is EyeState.CLOSED
-    state_color  = (0, 0, 220) if is_closed else (0, 210, 0)
-
-    # Build display lines: (text, color)
-    lines = [
-        (f"Blinks : {blink_result.blink_count}",            (230, 230, 230)),
-        (f"L-EAR  : {blink_result.left_ear:.3f}",           (180, 180, 180)),
-        (f"R-EAR  : {blink_result.right_ear:.3f}",          (180, 180, 180)),
-        (f"Avg EAR: {blink_result.average_ear:.3f}",        (180, 210, 255)),
-        (f"Eyes   : {blink_result.eye_state.value}",        state_color),
-    ]
-
-    # Show live closure type + duration only when eyes are closed or
-    # immediately after — avoids a stale label cluttering the normal view.
-    if is_closed or blink_result.closure_duration_s > 0.0:
-        event_text  = blink_result.last_closure_type.value
-        dur_text    = f"[{event_text}  {blink_result.closure_duration_s:.2f}s]"
-        dur_color   = (0, 140, 255) if is_closed else (130, 130, 130)
-        lines.append((dur_text, dur_color))
-
-    for i, (text, color) in enumerate(lines):
-        cv2.putText(
-            frame_bgr, text, (x, y_base + i * line_gap),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 1, cv2.LINE_AA,
-        )
-
-
-def main() -> None:
-    # ── 1. Ensure model file is present ──────────────────────────────
-    try:
-        download_model(MODEL_FILENAME, MODEL_URL)
-    except RuntimeError as err:
-        print(f"[ERROR] {err}", file=sys.stderr)
-        return
-
-    # ── 2. Open webcam ────────────────────────────────────────────────
-    try:
-        cap = init_webcam(CAMERA_INDEX)
-    except RuntimeError as err:
-        print(f"[ERROR] {err}", file=sys.stderr)
-        return
-
-    # ── 3. Create detector ────────────────────────────────────────────
-    detector = init_face_landmarker(MODEL_FILENAME)
-
-    processor     = LandmarkProcessor(FRAME_WIDTH, FRAME_HEIGHT)
-    blink_det     = BlinkDetector()
-
-    print("[INFO] Pipeline initialised — showing live feed.")
-    print("       Green mesh = face detected.  Red text = no face found.")
-
-    # Monotonic session start used to build timestamps for detect_for_video().
-    session_start_s = time.monotonic()
-    prev_time_s     = session_start_s
-    consecutive_read_failures = 0
-
-    try:
-        while True:
-            ret, frame = cap.read()
-
-            if not ret or frame is None:
-                consecutive_read_failures += 1
-                if consecutive_read_failures >= 30:
-                    print("[ERROR] 30 consecutive frame-read failures — webcam likely disconnected.",
-                          file=sys.stderr)
-                    break
-                print(f"[WARN] Frame read failed (attempt {consecutive_read_failures}) — retrying.",
-                      file=sys.stderr)
-                time.sleep(0.05)
-                continue
-
-            consecutive_read_failures = 0   # reset on a successful read
-
-            # Timestamp in ms required by detect_for_video(); must be
-            # monotonically increasing — time.monotonic() guarantees this.
-            timestamp_ms = int((time.monotonic() - session_start_s) * 1000)
-
-            resized_frame, result = detect_landmarks(detector, frame, timestamp_ms)
-
-            # ── Phase 2: coordinate conversion + blink detection ────────────────
-            processor.update(result)
-            timestamp_s  = timestamp_ms / 1000.0
-            blink_result = blink_det.update(processor, timestamp_s)
-
-            face_found = draw_face_mesh(resized_frame, result)
-
-
-            # FPS: simple delta-time (no rolling average needed for a
-            # live display; a 1-frame delta is stable enough at 10-15 FPS).
-            now = time.monotonic()
-            fps = 1.0 / max(now - prev_time_s, 1e-6)
-            prev_time_s = now
-
-            # Existing overlay + new blink overlay
-            draw_overlay(resized_frame, fps, face_found)
-            draw_blink_overlay(resized_frame, blink_result) 
-
-            cv2.imshow(WINDOW_NAME, resized_frame)
-
-            # waitKey(1) keeps the GUI event loop alive.
-            # 'q' exits cleanly; ESC (27) is also caught as a convenience.
-            key = cv2.waitKey(1) & 0xFF
-            if key in (ord('q'), 27):
-                break
-
-    except KeyboardInterrupt:
-        print("\n[INFO] Interrupted by Ctrl+C.")
-
-    finally:
-        cap.release()
-        detector.close()
-        cv2.destroyAllWindows()
-        print("[INFO] Resources released. Session ended cleanly.")
-
-
-if __name__ == "__main__":
-    main()
+    return float((vertical_a + vertical_b) / (2.0 * horizontal))

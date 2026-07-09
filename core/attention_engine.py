@@ -4,9 +4,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
-from blink_detector import BlinkResult, EyeState, ClosureType
-from head_pose_estimator import HeadPoseResult
-from gaze_estimator import GazeResult, HorizontalDirection, VerticalDirection
+from .blink_detector import BlinkResult, EyeState, ClosureType
+from .head_pose_estimator import HeadPoseResult
+from .gaze_estimator import GazeResult, HorizontalDirection, VerticalDirection
 
 
 # ---------------- Penalty System ----------------
@@ -214,9 +214,16 @@ class AttentionEngine:
             self._smoothed_score = raw_score
             self._ema_initialized = True
         else:
-            self._smoothed_score = (
-                EMA_ALPHA * raw_score + (1.0 - EMA_ALPHA) * self._smoothed_score
-            )
+            threshold = 1.0  
+            step_size = 0.65
+
+            diff = raw_score - self._smoothed_score
+
+            if abs(diff) > threshold:
+                if diff > 0:
+                    self._smoothed_score = min(100, self._smoothed_score + step_size)
+                else:
+                    self._smoothed_score = max(0, self._smoothed_score - step_size)
 
         # print(self._smoothed_score)
 
