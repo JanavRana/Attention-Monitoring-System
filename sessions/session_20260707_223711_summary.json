@@ -1,0 +1,22 @@
+{
+  "session_start": "2026-07-07T22:37:11",
+  "session_duration_sec": 62.5,
+  "ticks_logged": 58,
+  "average_attention_score": 98.5,
+  "minimum_attention_score": 88.3,
+  "maximum_attention_score": 100.0,
+  "time_attentive_s": 60.1,
+  "time_distracted_s": 2.7,
+  "longest_distracted_streak_s": 2.1,
+  "attention_state_distribution_pct": {
+    "HIGHLY_ATTENTIVE": 93.1,
+    "NO_FACE": 5.2,
+    "ATTENTIVE": 1.7
+  },
+  "total_blinks": 11,
+  "avg_blink_rate_per_min": 10.6,
+  "long_eye_closure_events": 0,
+  "pct_time_gaze_center": 79.3,
+  "face_loss_duration_s": 2.7,
+  "disclaimer": "This score reflects visual engagement signals only \u2014 not a measurement of comprehension or mental focus."
+}
