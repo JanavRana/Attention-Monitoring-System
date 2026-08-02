@@ -1,6 +1,6 @@
-# Student Attention Monitoring System
+# Visual Engagement Analysis System
 
-A real-time computer vision system that estimates a student's visual engagement during online learning sessions using facial landmarks. The system analyzes eye blinks, gaze direction, head pose, and face presence to generate an attention score, log session statistics, and produce an interactive HTML report.
+A real-time computer vision system that estimates a person's visual engagement during online learning sessions using facial landmarks. The system analyzes eye blinks, gaze direction, head pose, and face presence to generate an attention score, log session statistics, and produce an interactive HTML report.
 
 > **Disclaimer:** This project measures visual engagement signals only. It is **not** a measurement of comprehension, learning ability, intelligence, or mental focus.
 
